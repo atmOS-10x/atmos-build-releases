@@ -1,0 +1,240 @@
+# Installs the atmOS CLI from a GitHub Release archive on Windows. Needs
+# only PowerShell 5.1+; no Node, npm, or compiler.
+#
+#   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; irm https://raw.githubusercontent.com/atmOS-10x/atmos-build-releases/main/install.ps1 | iex
+#
+# Windows PowerShell 5.1 does not offer TLS 1.2 by default, so the one-liner sets it
+# before `irm`; the line below keeps it for this script's own downloads.
+#
+# Environment:
+#   ATMOS_CHANNEL            release train to follow: stable, nightly, or preview
+#                            (default: stable; preview is a maintainers' test train)
+#   ATMOS_VERSION            exact version to install (overrides ATMOS_CHANNEL)
+#   ATMOS_HOME               atmOS home directory (default: ~\.atmos-build)
+#   ATMOS_INSTALL_BIN_DIR    where the atmos-build.cmd shim goes (default: ~\.local\bin)
+#   ATMOS_RELEASE_BASE_URL   mirror for releases/download (default: GitHub)
+# The legacy T3CODE_* names still work and win when both are set.
+#
+# The archive is unpacked into $ATMOS_HOME\runtime\versions\<version>, the
+# same layout `atmos-build service install` uses, so the service reuses this download.
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+foreach ($name in "CHANNEL", "VERSION", "HOME", "INSTALL_BIN_DIR", "RELEASE_BASE_URL") {
+  $atmosValue = [Environment]::GetEnvironmentVariable("ATMOS_$name")
+  if (-not [Environment]::GetEnvironmentVariable("T3CODE_$name") -and $atmosValue) {
+    [Environment]::SetEnvironmentVariable("T3CODE_$name", $atmosValue)
+  }
+}
+
+# The source repository is private; releases are published to this public one.
+# Keep in sync with CLI_RELEASE_REPOSITORY in packages/shared/src/cliRelease.ts (a test checks).
+$repo = "atmOS-10x/atmos-build-releases"
+$baseUrl = if ($env:T3CODE_RELEASE_BASE_URL) { $env:T3CODE_RELEASE_BASE_URL.TrimEnd("/") } else { "https://github.com/$repo/releases/download" }
+$t3Home = if ($env:T3CODE_HOME) { $env:T3CODE_HOME } else { Join-Path $HOME ".atmos-build" }
+$binDir = if ($env:T3CODE_INSTALL_BIN_DIR) { $env:T3CODE_INSTALL_BIN_DIR } else { Join-Path $HOME ".local\bin" }
+
+function Fail([string] $message) {
+  Write-Error "atmos-build install: $message"
+  exit 1
+}
+
+$terminal = -not [Console]::IsErrorRedirected -and $env:TERM -ne "dumb"
+$interactive = $terminal -and $Host.UI.SupportsVirtualTerminal
+if ($interactive) {
+  # Legacy code pages may support ANSI escapes but not the logo or bar glyphs.
+  $glyphs = -join [char[]](0x2588, 0x2580, 0x2584, 0x25A0, 0x00B7)
+  $encoding = [Console]::Error.Encoding
+  $interactive = $encoding.GetString($encoding.GetBytes($glyphs)) -eq $glyphs
+}
+$esc = [char]27
+$reset = $bold = $muted = $accent = $green = ""
+if ($interactive -and -not $env:NO_COLOR) {
+  $reset = "$esc[0m"; $bold = "$esc[1m"; $muted = "$esc[2m"
+  $accent = "$esc[94m"; $green = "$esc[32m"
+}
+function Step([string] $message) {
+  if ($interactive) { [Console]::Error.Write("`r$esc[2K  $muted$message$reset") }
+  else { [Console]::Error.WriteLine("  $message") }
+}
+function Draw-Download([long] $bytes, [long] $total) {
+  if (-not $interactive) { return }
+  $columns = [Console]::WindowWidth
+  if ($columns -le 0) { $columns = 80 }
+  if ($total -gt 0 -and $columns -ge 9) {
+    $percent = [Math]::Min(100, [Math]::Floor($bytes * 100.0 / $total))
+    $width = [Math]::Min(32, $columns - 8)
+    $filled = [int][Math]::Floor($percent * $width / 100)
+    $bar = ([string][char]0x25A0) * $filled
+    $rest = ([string][char]0x00B7) * ($width - $filled)
+    $sizes = ("  {0:F1} / {1:F1} MB" -f ($bytes / 1MB), ($total / 1MB))
+    if ($width + 7 + $sizes.Length -ge $columns) { $sizes = "" }
+    [Console]::Error.Write(("`r$esc[2K  $accent$bar$reset$muted$rest$reset {0,3}%" -f $percent) + "$muted$sizes$reset")
+  } else {
+    $line = if ($columns -ge 32) { "  Downloading  {0:F1} MB" -f ($bytes / 1MB) } else { "  {0:F1} MB" -f ($bytes / 1MB) }
+    [Console]::Error.Write("`r$esc[2K" + $line.Substring(0, [Math]::Min($line.Length, $columns - 1)))
+  }
+}
+function Fetch([string] $uri, [string] $destination, [switch] $progress) {
+  if (-not $progress -or -not $interactive) {
+    $ProgressPreference = if ($progress -and $terminal) { "Continue" } else { "SilentlyContinue" }
+    Invoke-WebRequest -Uri $uri -OutFile $destination -UseBasicParsing
+    return
+  }
+  Add-Type -AssemblyName System.Net.Http
+  $client = New-Object System.Net.Http.HttpClient
+  $response = $source = $file = $null
+  try {
+    $response = $client.GetAsync($uri, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    $response.EnsureSuccessStatusCode() | Out-Null
+    $source = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $file = [IO.File]::Create($destination)
+    $buffer = New-Object byte[] 65536
+    $bytes = 0L
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    Draw-Download 0 $response.Content.Headers.ContentLength
+    while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
+      $file.Write($buffer, 0, $count)
+      $bytes += $count
+      if ($clock.ElapsedMilliseconds -ge 100) {
+        Draw-Download $bytes $response.Content.Headers.ContentLength
+        $clock.Restart()
+      }
+    }
+    Draw-Download $bytes $bytes
+    [Console]::Error.WriteLine()
+  } finally {
+    if ($file) { $file.Dispose() }
+    if ($source) { $source.Dispose() }
+    if ($response) { $response.Dispose() }
+    $client.Dispose()
+  }
+}
+if ($interactive) {
+  [Console]::Error.WriteLine("`n  ${bold}atmOS$reset`n  ${muted}CLI installer$reset`n")
+}
+Step "Finding your release..."
+
+# PROCESSOR_ARCHITEW6432 bypasses WOW64 emulation; 5.1 hosts can lack RuntimeInformation's required .NET version.
+$rawArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$arch = switch ($rawArch) {
+  "AMD64" { "x64" }
+  "ARM64" { "arm64" }
+  default { Fail "unsupported architecture $rawArch" }
+}
+
+$channel = if ($env:T3CODE_CHANNEL) { $env:T3CODE_CHANNEL } else { "stable" }
+$version = $env:T3CODE_VERSION
+if (-not $version) {
+  if ($channel -notin "stable", "nightly", "preview") { Fail "ATMOS_CHANNEL must be stable, nightly, or preview" }
+  if ($channel -eq "stable") {
+    # release.yml marks only plain stable releases latest, and stable builds every
+    # platform. This github.com page is not cut off by newer nightlies or the API quota.
+    try {
+      $release = Invoke-RestMethod -Uri "https://github.com/$repo/releases/latest" -Headers @{ "User-Agent" = "atmos-build-install"; "Accept" = "application/json" }
+      if ($release.tag_name -match '^v(\d+\.\d+\.\d+)$') { $version = $Matches[1] }
+    } catch {}
+  } else {
+    # Nightly and preview runs can skip platforms, so take the newest release
+    # that has an archive for this one.
+    $assetPattern = "^atmos-build-(\d+\.\d+\.\d+-$channel\.\d+\.\d+)-win32-$arch\.zip$"
+    for ($page = 1; -not $version -and $page -le 10; $page++) {
+      # No @(): Windows PowerShell 5.1 emits a JSON array as one object, which @() would nest.
+      $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100&page=$page" -Headers @{ "User-Agent" = "atmos-build-install" }
+      foreach ($release in $releases) {
+        if ($release.draft) { continue }
+        foreach ($asset in $release.assets) {
+          if ($asset.name -match $assetPattern) { $version = $Matches[1]; break }
+        }
+        if ($version) { break }
+      }
+      if (-not $releases) { break }
+    }
+  }
+  if (-not $version) { Fail "found no $channel release with an archive for win32-$arch; set ATMOS_CHANNEL or ATMOS_VERSION" }
+}
+if ($version -match '-preview\.') {
+  Write-Warning "atmos-build $version is a preview build. Preview builds are cut by maintainers from unreleased branches to exercise the release pipeline. They can be broken, receive no fixes, and are never offered as updates. Set ATMOS_CHANNEL=stable (the default) for a supported build."
+  if ($channel -ne "preview" -and -not $env:T3CODE_VERSION) {
+    Fail "refusing a preview build that was not explicitly requested"
+  }
+}
+
+$stem = "atmos-build-$version-win32-$arch"
+$archive = "$stem.zip"
+$versionsDir = Join-Path $t3Home "runtime\versions"
+$targetDir = Join-Path $versionsDir $version
+$marker = Join-Path $targetDir ".install-complete"
+
+if ((Test-Path (Join-Path $targetDir "atmos-build.exe")) -and (Test-Path $marker) -and ((Get-Content $marker -Raw).Trim() -eq $version)) {
+  Step "Version $version is already downloaded."
+} else {
+  New-Item -ItemType Directory -Force -Path $versionsDir | Out-Null
+  $staging = Join-Path $versionsDir (".staging-" + [System.IO.Path]::GetRandomFileName())
+  New-Item -ItemType Directory -Path $staging | Out-Null
+  try {
+    if ($interactive) { [Console]::Error.Write("`r$esc[2K") }
+    [Console]::Error.WriteLine("  ${muted}Installing$reset atmOS $bold$version$reset`n")
+    Step "Downloading..."
+    try {
+      Fetch "$baseUrl/v$version/SHA256SUMS" (Join-Path $staging "SHA256SUMS")
+    } catch {
+      $status = $_.Exception.Response.StatusCode.value__
+      if ($status -eq 404) {
+        Fail "atmos-build $version has no release archive for win32-$arch"
+      }
+      throw
+    }
+    Fetch "$baseUrl/v$version/$archive" (Join-Path $staging $archive) -progress
+
+    Step "Verifying the download..."
+
+    $expected = (Get-Content (Join-Path $staging "SHA256SUMS") | Where-Object { $_ -match "\s\*?$([regex]::Escape($archive))$" } | Select-Object -First 1)
+    if (-not $expected) { Fail "$archive is not listed in SHA256SUMS" }
+    $expected = ($expected -split "\s+")[0].ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $staging $archive)).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) { Fail "checksum mismatch for $archive" }
+
+    Step "Extracting atmOS..."
+    # The archive module reads the global preference, not the caller's local scope.
+    $savedProgress = $global:ProgressPreference
+    try {
+      $global:ProgressPreference = "SilentlyContinue"
+      Expand-Archive -Path (Join-Path $staging $archive) -DestinationPath $staging -Force
+    } finally { $global:ProgressPreference = $savedProgress }
+    Get-ChildItem (Join-Path $staging $stem) | Move-Item -Destination $staging
+    Remove-Item (Join-Path $staging $stem), (Join-Path $staging $archive), (Join-Path $staging "SHA256SUMS") -Recurse -Force
+
+    & (Join-Path $staging "atmos-build.exe") --version | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail "the downloaded executable does not run" }
+    Set-Content -Path (Join-Path $staging ".install-complete") -Value $version -NoNewline
+
+    if (Test-Path $targetDir) { Remove-Item $targetDir -Recurse -Force }
+    Move-Item $staging $targetDir
+  } catch {
+    if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
+    throw
+  }
+}
+
+Step "Setting up the atmos command..."
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+$shim = Join-Path $binDir "atmos-build.cmd"
+# UTF-8 without a BOM: cmd.exe reads the shim as-is, and ASCII would corrupt
+# non-ASCII characters in the user's home path.
+[System.IO.File]::WriteAllText($shim, "@echo off`r`n`"$(Join-Path $targetDir 'atmos-build.exe')`" %*", (New-Object System.Text.UTF8Encoding $false))
+Copy-Item -Path $shim -Destination (Join-Path $binDir "atmos.cmd") -Force
+Copy-Item -Path $shim -Destination (Join-Path $binDir "t3.cmd") -Force
+# Pruning keeps what this shim points at; a background service cannot see $binDir otherwise.
+$launchers = Join-Path $t3Home "runtime\launchers"
+$shimPath = (Resolve-Path $shim).Path
+if (-not ((Test-Path $launchers) -and ((Get-Content $launchers) -contains $shimPath))) {
+  [System.IO.File]::AppendAllText($launchers, "$shimPath`r`n", (New-Object System.Text.UTF8Encoding $false))
+}
+if ($interactive) { [Console]::Error.Write("`r$esc[2K") }
+[Console]::Error.WriteLine("  ${green}Installed atmOS $version$reset`n")
+if (($env:PATH -split ";") -notcontains $binDir) {
+  Write-Host "  Add $binDir to your PATH, then run ${bold}atmos$reset.`n"
+} else {
+  Write-Host "  Run ${bold}atmos$reset to get started.`n"
+}
