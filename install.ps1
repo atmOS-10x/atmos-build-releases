@@ -16,7 +16,7 @@
 # The legacy T3CODE_* names still work and win when both are set.
 #
 # The archive is unpacked into $ATMOS_HOME\runtime\versions\<version>, the
-# same layout `atmos-build service install` uses, so the service reuses this download.
+# same layout `atmos-build service install` (a Task Scheduler task) uses, so it reuses this download.
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
